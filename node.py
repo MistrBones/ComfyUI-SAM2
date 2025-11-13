@@ -25,6 +25,22 @@ import folder_paths
 from hydra import initialize
 from hydra.core.global_hydra import GlobalHydra
 
+# Import the new point extraction utilities
+try:
+    import point_extraction_utils
+except ImportError:
+    print("Error: Could not import 'point_extraction_utils.py'. Make sure it is in the same directory as 'node.py'.")
+    # As a fallback, create dummy functions so the rest of the file can load
+    class DummyPointExtraction:
+        def get_positive_points(self, boxes, num_points_per_box=1):
+            return np.empty((0, 2), dtype=np.float32)
+        def get_negative_points(self, boxes, image_shape, num_points=5):
+            return np.empty((0, 2), dtype=np.float32)
+        def combine_points_and_labels(self, positive_points, negative_points):
+            return None, None
+    point_extraction_utils = DummyPointExtraction()
+
+
 logger = logging.getLogger("ComfyUI-SAM2")
 
 sam_model_dir_name = "sam2"
@@ -186,12 +202,16 @@ def groundingdino_predict(dino_model, image, prompt, threshold):
             outputs = model(image[None], captions=[caption])
         logits = outputs["pred_logits"].sigmoid()[0]  # (nq, 256)
         boxes = outputs["pred_boxes"][0]  # (nq, 4)
+        
         # filter output
         logits_filt = logits.clone()
         boxes_filt = boxes.clone()
         filt_mask = logits_filt.max(dim=1)[0] > box_threshold
         logits_filt = logits_filt[filt_mask]  # num_filt, 256
         boxes_filt = boxes_filt[filt_mask]  # num_filt, 4
+        
+        # Return boxes_filt.cpu() and also logits_filt.cpu()
+        # We don't use logits_filt for now, but this is where you'd get them.
         return boxes_filt.cpu()
 
     dino_image = load_dino_image(image.convert("RGB"))
@@ -216,15 +236,55 @@ def create_pil_output(image_np, masks, boxes_filt):
 
 
 def create_tensor_output(image_np, masks, boxes_filt):
+    """
+    Create a batch of preview images and masks for each detected object.
+    
+    Args:
+        image_np (np.ndarray): Original RGBA or RGB image array.
+        masks (np.ndarray): Array of shape (N, H, W) or (N, 1, H, W) where N is number of masks.
+        boxes_filt (torch.Tensor or np.ndarray): Filtered bounding boxes (optional, not always used).
+
+    Returns:
+        tuple[list[Image.Image], list[Image.Image]]:
+            output_images: preview images showing segmentation
+            output_masks: grayscale or binary mask images
+    """
+    list_length = len(masks)
+    print(f"The length of the masks input is: {list_length}")
     output_masks, output_images = [], []
-    boxes_filt = boxes_filt.numpy().astype(int) if boxes_filt is not None else None
-    for mask in masks:
-        image_np_copy = copy.deepcopy(image_np)
-        image_np_copy[~np.any(mask, axis=0)] = np.array([0, 0, 0, 0])
+
+    if boxes_filt is not None and isinstance(boxes_filt, torch.Tensor):
+        boxes_filt = boxes_filt.cpu().numpy().astype(int)
+    elif boxes_filt is not None:
+        boxes_filt = boxes_filt.astype(int)
+
+    # Handle 4D inputs (N, 1, H, W) by squeezing the channel dimension
+    if masks.ndim == 4 and masks.shape[1] == 1:
+        masks = masks.squeeze(1)
+
+    # Ensure masks are boolean for indexing, but keep grayscale values if desired
+    for i, mask in enumerate(masks):
+        mask = np.asarray(mask)
+        if mask.dtype != bool:
+            # If it's a probability or grayscale mask, threshold lightly for visualization only
+            vis_mask = mask > 0.5
+        else:
+            vis_mask = mask
+
+        image_np_copy = image_np.copy()
+        image_np_copy[~np.any(vis_mask, axis=0)] = np.array([0, 0, 0, 0])
+
         output_image, output_mask = split_image_mask(Image.fromarray(image_np_copy))
-        output_masks.append(output_mask)
         output_images.append(output_image)
-    return (output_images, output_masks)
+        output_masks.append(output_mask)
+
+    list_length = len(output_masks)
+    print(f"The length of the mask batch is: {list_length}")
+
+    list_length = len(output_images)
+    print(f"The length of the image batch is: {list_length}")
+
+    return output_images, output_masks
 
 
 def split_image_mask(image):
@@ -239,24 +299,104 @@ def split_image_mask(image):
     return (image_rgb, mask)
 
 
-def sam_segment(sam_model, image, boxes):
+def sam_segment(sam_model, image, boxes, 
+                use_point_prompts=False, positive_points_per_box=1, negative_points_count=0):
+    """
+    Updated segmentation function to optionally use point prompts.
+    
+    Args:
+        sam_model: The loaded SAM2 model.
+        image: The input PIL Image.
+        boxes: A torch.Tensor of bounding boxes (N, 4).
+        use_point_prompts (bool): Whether to generate and use point prompts.
+        positive_points_per_box (int): Number of positive points inside each box.
+        negative_points_count (int): Number of negative points outside all boxes.
+    """
     if boxes.shape[0] == 0:
         return None
+    
     predictor = SAM2ImagePredictor(sam_model)
     image_np = np.array(image)
     image_np_rgb = image_np[..., :3]
     predictor.set_image(image_np_rgb)
+    
+    point_coords, point_labels = None, None
+    boxes_to_pass = boxes
+    
+    if use_point_prompts:
+        # Convert boxes to numpy for utility functions
+        boxes_np = boxes.cpu().numpy()
+        num_boxes = boxes_np.shape[0]
+        
+        # Generate points per box
+        all_point_coords = []
+        all_point_labels = []
+        
+        for i in range(num_boxes):
+            box = boxes_np[i:i+1]  # Keep as (1, 4) for the utility function
+            
+            # 1. Get positive points (inside this box)
+            pos_points = point_extraction_utils.get_positive_points(
+                box, 
+                num_points_per_box=positive_points_per_box
+            )
+            
+            # 2. Get negative points (outside this box)
+            # For simplicity, we generate negative points outside ALL boxes
+            # and use the same set for each box
+            if i == 0:  # Only generate once
+                image_shape_hw = image_np_rgb.shape[:2]
+                neg_points = point_extraction_utils.get_negative_points(
+                    boxes_np,  # Pass all boxes to avoid them
+                    image_shape=image_shape_hw, 
+                    num_points=negative_points_count
+                )
+            
+            # 3. Combine points for this box
+            box_point_coords, box_point_labels = point_extraction_utils.combine_points_and_labels(
+                pos_points, 
+                neg_points
+            )
+            
+            if box_point_coords is not None:
+                all_point_coords.append(box_point_coords)
+                all_point_labels.append(box_point_labels)
+        
+        # Stack all points into batched format: (B, N, 2) and (B, N)
+        if all_point_coords:
+            point_coords = np.stack(all_point_coords, axis=0)
+            point_labels = np.stack(all_point_labels, axis=0)
+            print(f"Using {point_coords.shape[0]} boxes with {point_coords.shape[1]} points each "
+                  f"({positive_points_per_box} pos per box, {negative_points_count} neg shared).")
+        else:
+            point_coords = None
+            point_labels = None
+
+    # Debug output
+    print("box shape:", boxes_to_pass.shape)
+    if point_coords is not None:
+        print("points shape:", point_coords.shape)
+        print("labels shape:", point_labels.shape)
+    else:
+        print("points: None")
+        print("labels: None")
+
     sam_device = comfy.model_management.get_torch_device()
     masks, scores, _ = predictor.predict(
-        point_coords=None, point_labels=None, box=boxes, multimask_output=False
+        point_coords=point_coords,  # Shape: (B, N, 2) or None
+        point_labels=point_labels,  # Shape: (B, N) or None
+        box=boxes_to_pass,          # Shape: (B, 4)
+        multimask_output=True
     )
+    
     print("scores: ", scores)
     print("masks shape before any modification:", masks.shape)
     if masks.ndim == 3:
         masks = np.expand_dims(masks, axis=0)
+
     print("masks shape after ensuring 4D:", masks.shape)
-    masks = np.transpose(masks, (1, 0, 2, 3))
-    return create_tensor_output(image_np, masks, boxes)
+    
+    return create_tensor_output(image_np, masks, boxes)   
 
 
 class SAM2ModelLoader:
@@ -308,6 +448,11 @@ class GroundingDinoSAM2Segment:
                     "FLOAT",
                     {"default": 0.3, "min": 0, "max": 1.0, "step": 0.01},
                 ),
+            },
+            "optional": {
+                "use_point_prompts": ("BOOLEAN", {"default": True}),
+                "positive_points_per_box": ("INT", {"default": 1, "min": 0, "max": 10, "step": 1}),
+                "negative_points_count": ("INT", {"default": 5, "min": 0, "max": 50, "step": 1}),
             }
         }
 
@@ -315,26 +460,55 @@ class GroundingDinoSAM2Segment:
     FUNCTION = "main"
     RETURN_TYPES = ("IMAGE", "MASK")
 
-    def main(self, grounding_dino_model, sam_model, image, prompt, threshold):
+    def main(self, grounding_dino_model, sam_model, image, prompt, threshold,
+             use_point_prompts=True, positive_points_per_box=1, negative_points_count=5):
+        
         res_images = []
         res_masks = []
         for item in image:
             item = Image.fromarray(
                 np.clip(255.0 * item.cpu().numpy(), 0, 255).astype(np.uint8)
             ).convert("RGBA")
+            
             boxes = groundingdino_predict(grounding_dino_model, item, prompt, threshold)
+            
             if boxes.shape[0] == 0:
-                break
-            (images, masks) = sam_segment(sam_model, item, boxes)
-            res_images.extend(images)
-            res_masks.extend(masks)
-        if len(res_images) == 0:
-            _, height, width, _ = image.size()
-            empty_mask = torch.zeros(
-                (1, height, width), dtype=torch.uint8, device="cpu"
+                # No boxes found, skip segmentation
+                continue
+                
+            (images, masks) = sam_segment(
+                sam_model, 
+                item, 
+                boxes,
+                use_point_prompts=use_point_prompts,
+                positive_points_per_box=positive_points_per_box,
+                negative_points_count=negative_points_count
             )
-            return (empty_mask, empty_mask)
-        return (torch.cat(res_images, dim=0), torch.cat(res_masks, dim=0))
+            
+            if images:
+                res_images.extend(images)
+                res_masks.extend(masks)
+                
+        if len(res_images) == 0:
+            # Handle case where no boxes were found or segmentation failed
+            print("No segments found. Returning empty masks.")
+            # Get original image shape for empty mask
+            _, height, width, _ = image.shape
+            empty_mask = torch.zeros(
+                (1, height, width), dtype=torch.float32, device="cpu"
+            )
+            empty_image = torch.zeros(
+                (1, height, width, 3), dtype=torch.float32, device="cpu"
+            )
+            return (empty_image, empty_mask)
+            
+        imageStack = torch.stack(res_images, dim=0)
+        imageStack = torch.squeeze(imageStack, dim=1)
+        maskStack = torch.stack(res_masks, dim=0)
+        print(f"The shape of the images is: {imageStack.shape}")
+        print(f"The shape of the masks is: {maskStack.shape}")
+        
+        return (imageStack, maskStack)
 
 
 class InvertMask:
