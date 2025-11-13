@@ -235,7 +235,7 @@ def create_pil_output(image_np, masks, boxes_filt):
     return output_images, output_masks
 
 
-def create_tensor_output(image_np, masks, boxes_filt):
+def create_tensor_output(image_np, masks):
     """
     Create a batch of preview images and masks for each detected object.
     
@@ -252,11 +252,6 @@ def create_tensor_output(image_np, masks, boxes_filt):
     list_length = len(masks)
     output_masks, output_images = [], []
 
-    if boxes_filt is not None and isinstance(boxes_filt, torch.Tensor):
-        boxes_filt = boxes_filt.cpu().numpy().astype(int)
-    elif boxes_filt is not None:
-        boxes_filt = boxes_filt.astype(int)
-
     # Handle 4D inputs (N, 1, H, W) by squeezing the channel dimension
     if masks.ndim == 4 and masks.shape[1] == 1:
         masks = masks.squeeze(1)
@@ -271,7 +266,7 @@ def create_tensor_output(image_np, masks, boxes_filt):
             vis_mask = mask
 
         image_np_copy = image_np.copy()
-        image_np_copy[~np.any(vis_mask, axis=0)] = np.array([0, 0, 0, 0])
+        image_np_copy[~vis_mask] = np.array([0, 0, 0, 0])
 
         output_image, output_mask = split_image_mask(Image.fromarray(image_np_copy))
         output_images.append(output_image)
@@ -359,6 +354,8 @@ def sam_segment(sam_model, image, boxes,
         if all_point_coords:
             point_coords = np.stack(all_point_coords, axis=0)
             point_labels = np.stack(all_point_labels, axis=0)
+            print(f"Using {point_coords.shape[0]} boxes with {point_coords.shape[1]} points each "
+                  f"(total {point_coords.shape[1]} points per box: {positive_points_per_box} pos, {negative_points_count} neg shared).")
         else:
             point_coords = None
             point_labels = None
@@ -373,7 +370,7 @@ def sam_segment(sam_model, image, boxes,
     
     if masks.ndim == 3:
         masks = np.expand_dims(masks, axis=0)    
-    return create_tensor_output(image_np, masks, boxes)   
+    return create_tensor_output(image_np, masks)   
 
 
 class SAM2ModelLoader:
