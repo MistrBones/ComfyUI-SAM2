@@ -12,7 +12,10 @@ def get_positive_points(boxes, num_points_per_box=1):
 
     Returns:
         np.ndarray: An array of positive points with shape (N * num_points_per_box, 2)
-        in (x, y) format.
+        in (x, y) format.  
+        NOTE - num_points_per_box is effectively always 1 due to 
+        the simplistic sampling method currently implemented
+        
     """
     if num_points_per_box != 1:
         # Placeholder for more complex logic (e.g., grid sampling)
