@@ -74,12 +74,10 @@ def get_negative_points(boxes, image_shape, num_points=5):
         y = np.random.randint(0, height)
         
         # Check if the point is inside ANY box
-        is_inside = False
-        for box in boxes:
-            x1, y1, x2, y2 = box
-            if x1 <= x < x2 and y1 <= y < y2:
-                is_inside = True
-                break
+        is_inside = np.any(
+            (boxes[:, 0] <= x) & (x < boxes[:, 2]) &
+            (boxes[:, 1] <= y) & (y < boxes[:, 3])
+        )
         
         if not is_inside:
             negative_points.append([x, y])
