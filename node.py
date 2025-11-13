@@ -266,7 +266,7 @@ def create_tensor_output(image_np, masks):
             vis_mask = mask
 
         image_np_copy = image_np.copy()
-        image_np_copy[~vis_mask] = np.array([0, 0, 0, 0])
+        image_np_copy[~np.any(vis_mask, axis=0)] = np.array([0, 0, 0, 0])
 
         output_image, output_mask = split_image_mask(Image.fromarray(image_np_copy))
         output_images.append(output_image)
