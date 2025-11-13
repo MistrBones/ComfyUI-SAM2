@@ -250,7 +250,6 @@ def create_tensor_output(image_np, masks, boxes_filt):
             output_masks: grayscale or binary mask images
     """
     list_length = len(masks)
-    print(f"The length of the masks input is: {list_length}")
     output_masks, output_images = [], []
 
     if boxes_filt is not None and isinstance(boxes_filt, torch.Tensor):
@@ -277,12 +276,6 @@ def create_tensor_output(image_np, masks, boxes_filt):
         output_image, output_mask = split_image_mask(Image.fromarray(image_np_copy))
         output_images.append(output_image)
         output_masks.append(output_mask)
-
-    list_length = len(output_masks)
-    print(f"The length of the mask batch is: {list_length}")
-
-    list_length = len(output_images)
-    print(f"The length of the image batch is: {list_length}")
 
     return output_images, output_masks
 
@@ -366,20 +359,9 @@ def sam_segment(sam_model, image, boxes,
         if all_point_coords:
             point_coords = np.stack(all_point_coords, axis=0)
             point_labels = np.stack(all_point_labels, axis=0)
-            print(f"Using {point_coords.shape[0]} boxes with {point_coords.shape[1]} points each "
-                  f"({positive_points_per_box} pos per box, {negative_points_count} neg shared).")
         else:
             point_coords = None
             point_labels = None
-
-    # Debug output
-    print("box shape:", boxes_to_pass.shape)
-    if point_coords is not None:
-        print("points shape:", point_coords.shape)
-        print("labels shape:", point_labels.shape)
-    else:
-        print("points: None")
-        print("labels: None")
 
     sam_device = comfy.model_management.get_torch_device()
     masks, scores, _ = predictor.predict(
@@ -389,13 +371,8 @@ def sam_segment(sam_model, image, boxes,
         multimask_output=True
     )
     
-    print("scores: ", scores)
-    print("masks shape before any modification:", masks.shape)
     if masks.ndim == 3:
-        masks = np.expand_dims(masks, axis=0)
-
-    print("masks shape after ensuring 4D:", masks.shape)
-    
+        masks = np.expand_dims(masks, axis=0)    
     return create_tensor_output(image_np, masks, boxes)   
 
 
@@ -505,9 +482,6 @@ class GroundingDinoSAM2Segment:
         imageStack = torch.stack(res_images, dim=0)
         imageStack = torch.squeeze(imageStack, dim=1)
         maskStack = torch.stack(res_masks, dim=0)
-        print(f"The shape of the images is: {imageStack.shape}")
-        print(f"The shape of the masks is: {maskStack.shape}")
-        
         return (imageStack, maskStack)
 
 
